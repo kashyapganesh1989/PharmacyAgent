@@ -27,8 +27,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from agent.tools import (
     ALL_TOOLS,
     ROLE_TOOL_ACCESS,
-    TOOL_RISK,
-    HIGH_RISK_TOOLS,
     HIGH_RISK_DESCRIPTIONS,
 )
 
@@ -50,34 +48,47 @@ user clearly that the action is pending approval, not completed.
 """
 
 
-def _make_guarded_tool(name: str, arg_name: str, pending_approvals: dict):
-    """Builds a tool that queues an approval request instead of acting."""
+def _queue_approval(tool_name: str, arg_name: str, value: str, pending_approvals: dict) -> str:
+    request_id = f"req_{uuid.uuid4().hex[:8]}"
+    pending_approvals[request_id] = {
+        "tool_name": tool_name,
+        "arg_name": arg_name,
+        "arg_value": value,
+        "status": "pending",
+    }
+    return (
+        f"⏸️ Approval required (request ID: {request_id}) before "
+        f"'{tool_name}' can run on '{value}'. A human admin must approve this "
+        f"in the UI before it takes effect."
+    )
 
+
+def _make_guarded_reset_password_tool(pending_approvals: dict):
     description = (
-        f"{HIGH_RISK_DESCRIPTIONS[name]} This action requires human approval "
-        f"and will NOT execute immediately — it only queues a request."
+        f"{HIGH_RISK_DESCRIPTIONS['reset_user_password']} This action requires "
+        f"human approval and will NOT execute immediately — it only queues a request."
     )
 
-    def _run(**kwargs):
-        value = kwargs.get(arg_name, "")
-        request_id = f"req_{uuid.uuid4().hex[:8]}"
-        pending_approvals[request_id] = {
-            "tool_name": name,
-            "arg_name": arg_name,
-            "arg_value": value,
-            "status": "pending",
-        }
-        return (
-            f"⏸️ Approval required (request ID: {request_id}) before "
-            f"'{name}' can run on '{value}'. A human admin must approve this "
-            f"in the UI before it takes effect."
-        )
+    def _run(username: str) -> str:
+        """Request a password reset for a store employee. Only queues the
+        request for human approval — does not execute immediately."""
+        return _queue_approval("reset_user_password", "username", username, pending_approvals)
 
-    return StructuredTool.from_function(
-        func=_run,
-        name=name,
-        description=description,
+    return StructuredTool.from_function(func=_run, name="reset_user_password", description=description)
+
+
+def _make_guarded_restart_device_tool(pending_approvals: dict):
+    description = (
+        f"{HIGH_RISK_DESCRIPTIONS['restart_store_device']} This action requires "
+        f"human approval and will NOT execute immediately — it only queues a request."
     )
+
+    def _run(device_id: str) -> str:
+        """Request a remote restart of a store device. Only queues the
+        request for human approval — does not execute immediately."""
+        return _queue_approval("restart_store_device", "device_id", device_id, pending_approvals)
+
+    return StructuredTool.from_function(func=_run, name="restart_store_device", description=description)
 
 
 def get_tools_for_role(role: str, pending_approvals: dict):
@@ -89,9 +100,9 @@ def get_tools_for_role(role: str, pending_approvals: dict):
     tools = [t for t in ALL_TOOLS if t.name in allowed_names]
 
     if "reset_user_password" in allowed_names:
-        tools.append(_make_guarded_tool("reset_user_password", "username", pending_approvals))
+        tools.append(_make_guarded_reset_password_tool(pending_approvals))
     if "restart_store_device" in allowed_names:
-        tools.append(_make_guarded_tool("restart_store_device", "device_id", pending_approvals))
+        tools.append(_make_guarded_restart_device_tool(pending_approvals))
 
     return tools
 

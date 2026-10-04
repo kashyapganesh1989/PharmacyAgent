@@ -69,15 +69,20 @@ class AuditCallbackHandler(BaseCallbackHandler):
         self.role = role
         self.tool_risk = tool_risk
         self._tool_start_times = {}
+        self._tool_names = {}
+        self._tool_inputs = {}
         self._llm_start_times = {}
         self.session_state.setdefault("trace", [])
 
     # ---- Tool lifecycle --------------------------------------------------
     def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
         self._tool_start_times[run_id] = time.time()
+        self._tool_names[run_id] = (serialized or {}).get("name", "unknown_tool")
+        self._tool_inputs[run_id] = input_str
 
     def on_tool_end(self, output, *, run_id, **kwargs):
-        name = kwargs.get("name") or "unknown_tool"
+        name = self._tool_names.pop(run_id, "unknown_tool")
+        input_str = self._tool_inputs.pop(run_id, "")
         started = self._tool_start_times.pop(run_id, time.time())
         latency_ms = round((time.time() - started) * 1000, 1)
         risk = self.tool_risk.get(name, "n/a")
@@ -89,7 +94,7 @@ class AuditCallbackHandler(BaseCallbackHandler):
             event_type="tool_call",
             name=name,
             risk_tier=risk,
-            input_data=kwargs.get("inputs", ""),
+            input_data=input_str,
             output_data=output,
             status="ok",
         )
@@ -103,7 +108,9 @@ class AuditCallbackHandler(BaseCallbackHandler):
         })
 
     def on_tool_error(self, error, *, run_id, **kwargs):
-        name = kwargs.get("name") or "unknown_tool"
+        name = self._tool_names.pop(run_id, "unknown_tool")
+        self._tool_start_times.pop(run_id, None)
+        self._tool_inputs.pop(run_id, None)
         log_event(
             self.session_state,
             session_id=self.session_id,

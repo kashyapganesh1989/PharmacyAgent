@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.agent import build_agent
-from agent.callbacks import AuditCallbackHandler, log_event, AUDIT_LOG_PATH
+from agent.callbacks import AuditCallbackHandler, log_event, emit, STATUS_ICON, AUDIT_LOG_PATH
 from agent.guardrails import check_prompt_injection, filter_output_pii
 from agent.rate_limiter import check_and_consume, current_usage
 from agent.tools import (
@@ -187,6 +187,28 @@ button[kind="secondary"], .deny-btn button {
 .badge-approved { background:#0D2A1E; border:1px solid #1A5C38; color:#4ADE80; }
 .badge-denied   { background:#2A0D0D; border:1px solid #5C1A1A; color:#FF6B6B; }
 
+/* ── Live pipeline (sidebar + per-turn trace) ── */
+.pipeline-box { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.pipeline-step {
+    background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--muted);
+    border-radius: 8px; padding: 6px 10px;
+}
+.pipeline-step.step-ok        { border-left-color: var(--green); }
+.pipeline-step.step-running   { border-left-color: var(--purple); }
+.pipeline-step.step-blocked   { border-left-color: var(--red); }
+.pipeline-step.step-pending   { border-left-color: var(--amber); }
+.pipeline-step.step-error     { border-left-color: var(--red); }
+.pipeline-step.step-redacted  { border-left-color: var(--amber); }
+.pipeline-icon { margin-right: 6px; }
+.pipeline-label {
+    font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--text);
+}
+.pipeline-detail {
+    font-size: 11.5px; color: var(--muted); margin-top: 2px; padding-left: 20px;
+    word-break: break-word;
+}
+
+
 .answer-card {
     background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent);
     border-radius: 14px; padding: 1.25rem 1.5rem; margin: 0.75rem 0; line-height: 1.75; font-size: 15px; color: var(--text);
@@ -210,9 +232,47 @@ for key, default in {
     "audit_log": [],
     "trace": [],
     "rate_limit_timestamps": [],
+    "last_turn_steps": [],
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+
+# =============================================================================
+# LIVE PIPELINE RENDERER
+# Renders the ordered sequence of steps for one turn as a vertical list of
+# cards. Called repeatedly, mid-script, as each stage of a turn completes —
+# both to populate the sidebar's "Live Pipeline" placeholder in real time,
+# and to render the frozen per-message trace in the Chat tab.
+# =============================================================================
+STATUS_CLASS = {
+    "ok": "step-ok", "running": "step-running", "blocked": "step-blocked",
+    "pending": "step-pending", "error": "step-error", "redacted": "step-redacted",
+}
+
+
+def render_pipeline(container, steps):
+    if not steps:
+        container.markdown(
+            '<p style="font-size:12px;color:#6A7A96;">No activity yet this turn.</p>',
+            unsafe_allow_html=True,
+        )
+        return
+    rows = []
+    for s in steps:
+        icon = STATUS_ICON.get(s["status"], "•")
+        cls = STATUS_CLASS.get(s["status"], "step-ok")
+        lat = f' · {s["latency_ms"]}ms' if s.get("latency_ms") else ""
+        detail = s.get("detail") or ""
+        rows.append(
+            f'<div class="pipeline-step {cls}">'
+            f'<span class="pipeline-label"><span class="pipeline-icon">{icon}</span>'
+            f'{s["step_no"]}. {s["label"]}</span>'
+            f'<div class="pipeline-detail">{detail}{lat}</div>'
+            f'</div>'
+        )
+    container.markdown('<div class="pipeline-box">' + "".join(rows) + '</div>', unsafe_allow_html=True)
+
 
 # =============================================================================
 # HERO SECTION
@@ -282,8 +342,14 @@ with st.sidebar:
 
     st.markdown('<hr style="border-color:#253450;margin:1.2rem 0;">', unsafe_allow_html=True)
 
+    st.markdown('<span class="section-label">🧭 Live Pipeline (this turn)</span>', unsafe_allow_html=True)
+    pipeline_box = st.empty()
+    render_pipeline(pipeline_box, st.session_state.last_turn_steps)
+
+    st.markdown('<hr style="border-color:#253450;margin:1.2rem 0;">', unsafe_allow_html=True)
+
     if st.button("🔄 Reset session"):
-        for key in ["chat_history", "pending_approvals", "audit_log", "trace", "rate_limit_timestamps"]:
+        for key in ["chat_history", "pending_approvals", "audit_log", "trace", "rate_limit_timestamps", "last_turn_steps"]:
             st.session_state[key] = [] if isinstance(st.session_state[key], list) else {}
         st.session_state.session_id = str(uuid.uuid4())[:8]
         st.rerun()
@@ -291,14 +357,11 @@ with st.sidebar:
     st.markdown('<hr style="border-color:#253450;margin:1.2rem 0;">', unsafe_allow_html=True)
     st.markdown("""
     <div style="font-size:13px;color:#6A7A96;line-height:1.9;">
-        <b style="color:#A8B4CC;font-size:14px;">Pipeline on every message:</b><br>
-        1. Rate limiter check<br>
-        2. Input guardrail (injection check)<br>
-        3. Role-based tool allowlist<br>
-        4. Agent executes tools<br>
-        5. High-risk tools → approval queue<br>
-        6. Output guardrail (PII/secret redaction)<br>
-        7. Everything logged to audit trail
+        <b style="color:#A8B4CC;font-size:14px;">Pipeline stages:</b><br>
+        ⏱ Rate limiter → 🛡 Input guardrail → 🔐 Role allowlist →<br>
+        🧠 LLM calls → 🔧 Tool calls → ⏸ Approval (high-risk) →<br>
+        🛡 Output guardrail → 💬 Response<br><br>
+        Every stage above shows live, in order, once you send a message.
     </div>
     """, unsafe_allow_html=True)
 
@@ -385,6 +448,18 @@ with tab_chat:
             st.markdown(turn["content"])
             for label, variant in turn.get("badges", []):
                 st.markdown(badge(label, variant.lower()), unsafe_allow_html=True)
+            steps = turn.get("steps")
+            if steps:
+                total_latency = sum(s["latency_ms"] for s in steps if s.get("latency_ms"))
+                with st.expander(f"🔍 View execution trace ({len(steps)} steps, {round(total_latency)}ms)"):
+                    for s in steps:
+                        icon = STATUS_ICON.get(s["status"], "•")
+                        lat = f" · {s['latency_ms']}ms" if s.get("latency_ms") else ""
+                        st.markdown(
+                            f"**{s['step_no']}. {icon} {s['label']}**{lat}  \n"
+                            f"<span style='color:#6A7A96;font-size:12.5px;'>{s.get('detail', '')}</span>",
+                            unsafe_allow_html=True,
+                        )
 
     user_msg = st.chat_input("Ask the Pharmacy IT Operations Agent...")
 
@@ -394,27 +469,64 @@ with tab_chat:
         else:
             st.session_state.chat_history.append({"role": "user", "content": user_msg, "badges": []})
 
-            allowed_req, retry_after, _ = check_and_consume(st.session_state)
+            turn_id = f"turn_{uuid.uuid4().hex[:8]}"
+            current_steps = []
+
+            def _live_render(steps):
+                render_pipeline(pipeline_box, steps)
+
+            allowed_req, retry_after, remaining = check_and_consume(st.session_state)
+            emit(
+                st.session_state, current_steps, turn_id=turn_id,
+                session_id=st.session_state.session_id, role=st.session_state.role,
+                step_type="rate_limit", label="Rate Limiter",
+                status="ok" if allowed_req else "blocked",
+                detail=(f"{remaining} requests remaining this window" if allowed_req
+                        else f"Limit reached — retry in {retry_after}s"),
+                on_step=_live_render,
+            )
             if not allowed_req:
                 msg = f"⏳ Rate limit reached. Try again in {retry_after}s."
-                log_event(st.session_state, session_id=st.session_state.session_id, role=st.session_state.role,
-                          event_type="rate_limit_block", name="chat", input_data=user_msg, output_data=msg, status="blocked")
-                st.session_state.chat_history.append({"role": "assistant", "content": msg, "badges": [("RATE LIMITED", "blocked")]})
+                st.session_state.chat_history.append({
+                    "role": "assistant", "content": msg, "badges": [("RATE LIMITED", "blocked")],
+                    "steps": current_steps, "turn_id": turn_id,
+                })
+                st.session_state.last_turn_steps = current_steps
                 st.rerun()
 
             blocked, reason = check_prompt_injection(user_msg)
+            emit(
+                st.session_state, current_steps, turn_id=turn_id,
+                session_id=st.session_state.session_id, role=st.session_state.role,
+                step_type="input_guardrail", label="Input Guardrail",
+                status="blocked" if blocked else "ok",
+                detail=reason if blocked else "No injection pattern matched",
+                on_step=_live_render,
+            )
             if blocked:
                 msg = f"🛡️ Blocked by input guardrail: {reason}"
-                log_event(st.session_state, session_id=st.session_state.session_id, role=st.session_state.role,
-                          event_type="guardrail_block", name="input_guardrail", input_data=user_msg, output_data=reason, status="blocked")
-                st.session_state.chat_history.append({"role": "assistant", "content": msg, "badges": [("BLOCKED", "blocked")]})
+                st.session_state.chat_history.append({
+                    "role": "assistant", "content": msg, "badges": [("BLOCKED", "blocked")],
+                    "steps": current_steps, "turn_id": turn_id,
+                })
+                st.session_state.last_turn_steps = current_steps
                 st.rerun()
 
             with st.spinner("🤖 Thinking..."):
                 try:
                     executor, tools = build_agent(active_key, st.session_state.role, st.session_state.pending_approvals)
+                    emit(
+                        st.session_state, current_steps, turn_id=turn_id,
+                        session_id=st.session_state.session_id, role=st.session_state.role,
+                        step_type="tool_allowlist", label="Role Allowlist",
+                        detail=f"{len(tools)} tool(s) bound for '{st.session_state.role}': "
+                               f"{', '.join(t.name for t in tools)}",
+                        on_step=_live_render,
+                    )
+
                     callback = AuditCallbackHandler(
-                        st.session_state, st.session_state.session_id, st.session_state.role, TOOL_RISK
+                        st.session_state, st.session_state.session_id, st.session_state.role, TOOL_RISK,
+                        turn_id, current_steps, on_step=_live_render,
                     )
                     chat_history_msgs = history_to_messages(st.session_state.chat_history)
                     result = executor.invoke(
@@ -425,34 +537,52 @@ with tab_chat:
 
                     cleaned, redactions = filter_output_pii(answer)
                     badges = []
+                    emit(
+                        st.session_state, current_steps, turn_id=turn_id,
+                        session_id=st.session_state.session_id, role=st.session_state.role,
+                        step_type="output_guardrail", label="Output Guardrail",
+                        status="redacted" if redactions else "ok",
+                        detail=f"Redacted: {', '.join(redactions)}" if redactions else "No PII/secrets detected",
+                        on_step=_live_render,
+                    )
                     if redactions:
                         badges.append((f"REDACTED: {', '.join(redactions)}", "blocked"))
-                        log_event(st.session_state, session_id=st.session_state.session_id, role=st.session_state.role,
-                                  event_type="guardrail_block", name="output_guardrail", input_data=answer,
-                                  output_data=f"redacted: {redactions}", status="redacted")
 
-                    st.session_state.chat_history.append({"role": "assistant", "content": cleaned, "badges": badges})
-                except Exception as e:
+                    emit(
+                        st.session_state, current_steps, turn_id=turn_id,
+                        session_id=st.session_state.session_id, role=st.session_state.role,
+                        step_type="response", label="Response Delivered", log_to_audit=False,
+                        on_step=_live_render,
+                    )
+
                     st.session_state.chat_history.append({
-                        "role": "assistant",
-                        "content": f"⚠️ Agent error: {e}",
-                        "badges": [("ERROR", "blocked")],
+                        "role": "assistant", "content": cleaned, "badges": badges,
+                        "steps": current_steps, "turn_id": turn_id,
                     })
+                except Exception as e:
+                    emit(
+                        st.session_state, current_steps, turn_id=turn_id,
+                        session_id=st.session_state.session_id, role=st.session_state.role,
+                        step_type="error", label="Agent Error", status="error", detail=str(e),
+                        on_step=_live_render,
+                    )
+                    st.session_state.chat_history.append({
+                        "role": "assistant", "content": f"⚠️ Agent error: {e}",
+                        "badges": [("ERROR", "blocked")], "steps": current_steps, "turn_id": turn_id,
+                    })
+            st.session_state.last_turn_steps = current_steps
             st.rerun()
 
 # ---- OBSERVABILITY TAB -------------------------------------------------------
 with tab_obs:
-    st.markdown('<span class="section-label">📊 Live Trace</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">📊 Live Trace — grouped by turn</span>', unsafe_allow_html=True)
     trace = st.session_state.trace
     if not trace:
         st.info("No activity yet — send a message in the Chat tab to generate a trace.")
     else:
-        df = pd.DataFrame(trace[::-1])
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-        total_latency = sum(t["latency_ms"] for t in trace)
-        tool_calls = [t for t in trace if t["type"] == "tool_call"]
-        llm_calls = [t for t in trace if t["type"] == "llm_call"]
+        total_latency = sum(t["latency_ms"] for t in trace if t.get("latency_ms"))
+        tool_calls = [t for t in trace if t["type"] == "tool_call" and t["status"] != "running"]
+        llm_calls = [t for t in trace if t["type"] == "llm_call" and t["status"] != "running"]
         st.markdown(f"""
         <div class="stats-row">
             <div class="stat-card"><div class="stat-value">{len(trace)}</div><div class="stat-label">TOTAL STEPS</div></div>
@@ -461,6 +591,24 @@ with tab_obs:
             <div class="stat-card"><div class="stat-value">{round(total_latency)}ms</div><div class="stat-label">TOTAL LATENCY</div></div>
         </div>
         """, unsafe_allow_html=True)
+
+        # Group steps by turn_id, most recent turn first, preserving in-turn order.
+        turn_order = []
+        turns = {}
+        for s in trace:
+            tid = s.get("turn_id", "n/a")
+            if tid not in turns:
+                turns[tid] = []
+                turn_order.append(tid)
+            turns[tid].append(s)
+
+        for tid in reversed(turn_order):
+            steps = turns[tid]
+            turn_latency = sum(s["latency_ms"] for s in steps if s.get("latency_ms"))
+            with st.expander(f"🧵 {tid} — {len(steps)} steps · {round(turn_latency)}ms", expanded=(tid == turn_order[-1])):
+                df = pd.DataFrame(steps)[["step_no", "time", "type", "label", "status", "latency_ms", "detail"]]
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
 
 # ---- AUDIT LOG TAB ------------------------------------------------------------
 with tab_audit:

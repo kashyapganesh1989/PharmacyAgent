@@ -1,220 +1,248 @@
 # =============================================================================
 # Pharmacy IT Operations Agent — Tools
-# Author : Abhinav Rawat · AI Architect · AI Playground
 #
-# Every tool below is a MOCK (no real backend). That is intentional: this is
-# a TRAINING DEMO about how to wire guardrails, approvals, audit and rate
-# limiting around tool-calling agents — not a production ITSM integration.
+# Every tool has: one job, a typed input schema, a docstring written for the
+# model, and a structured JSON result ({"ok": true/false, ...}) that the model
+# can act on — including whether a retry makes sense.
 #
-# Each tool is tagged with a RISK TIER. The tier drives two things:
-#   1. Which role can see/use the tool at all   (see ROLE_TOOL_ACCESS)
-#   2. Whether it needs human approval before it actually executes
-#      (see HIGH_RISK_TOOLS + the guarded-tool wrapper in agent.py)
+# Each tool is tagged with a RISK TIER. The tier drives three things:
+#   1. Which role can see/use the tool at all   (ROLE_TOOL_ACCESS)
+#   2. Which graph node runs it: high-risk tools run in the "admin_tools"
+#      node, and the graph PAUSES before that node until a human approves
+#      (see agent/graph.py — the approval gate is structural, not a prompt).
+#   3. Defense in depth: high-risk tools re-check the caller's role from the
+#      session config, never from anything the model passes in.
+#
+# External systems are mocks (agent/mock_services.py) or the local SQLite DB.
 # =============================================================================
 
-import random
-import uuid
+import hashlib
+import json
+import secrets
 from datetime import datetime, timedelta
+from typing import Literal
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
+from tenacity import RetryError, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from agent import db, mock_services
+from agent.callbacks import tool_emit
+from agent.mock_services import TransientError
 
 # -----------------------------------------------------------------------------
 # Risk tiers — the single source of truth every other module reads from.
 # -----------------------------------------------------------------------------
 TOOL_RISK = {
-    "search_knowledge_base": "low",
+    "search_inventory": "low",
     "check_system_status": "low",
-    "lookup_store_inventory_sync_status": "low",
+    "list_users": "low",
+    "preview_sql_reset": "low",
     "create_itsm_ticket": "medium",
-    "escalate_to_oncall": "medium",
-    "reset_user_password": "high",
-    "restart_store_device": "high",
+    "reset_sql_state": "high",
+    "update_user_role": "high",
+    "send_password_reset": "high",
 }
-
 HIGH_RISK_TOOLS = {name for name, risk in TOOL_RISK.items() if risk == "high"}
 
-# -----------------------------------------------------------------------------
-# Role-based tool access — the DEMO's guardrail #1: not every role can even
-# see every tool. A Store Associate never gets reset_user_password bound to
-# their agent at all; an IT Admin does (but it still needs approval).
-# -----------------------------------------------------------------------------
 ROLE_TOOL_ACCESS = {
-    "Store Associate": [
-        "search_knowledge_base",
-        "check_system_status",
-        "create_itsm_ticket",
-        "lookup_store_inventory_sync_status",
-        "escalate_to_oncall",
-    ],
-    "IT Admin": [
-        "search_knowledge_base",
-        "check_system_status",
-        "create_itsm_ticket",
-        "lookup_store_inventory_sync_status",
-        "escalate_to_oncall",
-        "reset_user_password",
-        "restart_store_device",
-    ],
+    "Store Associate": ["search_inventory", "check_system_status", "create_itsm_ticket"],
+    "IT Admin": list(TOOL_RISK.keys()),
 }
 
+# What the approval card says about each high-risk tool.
+HIGH_RISK_DESCRIPTIONS = {
+    "reset_sql_state": "Deletes all rows in the scope's tables and restores the seed data.",
+    "update_user_role": "Changes a user's role, and with it what they can access.",
+    "send_password_reset": "Issues a one-time password reset link to the user's email.",
+}
+
+
+def _ok(**data) -> str:
+    return json.dumps({"ok": True, **data})
+
+
+def _err(error: str, retryable: bool = False, hint: str = "") -> str:
+    out = {"ok": False, "error": error, "retryable": retryable}
+    if hint:
+        out["hint"] = hint
+    return json.dumps(out)
+
+
+def _caller(config: RunnableConfig) -> tuple[str, str]:
+    conf = (config or {}).get("configurable", {})
+    return conf.get("caller_role", "Store Associate"), conf.get("caller_user", "unknown")
+
+
 # -----------------------------------------------------------------------------
-# Mock data
+# LOW RISK — read-only
 # -----------------------------------------------------------------------------
-MOCK_KB = [
-    {
-        "title": "POS terminal freezes on checkout",
-        "tags": ["pos", "checkout", "freeze", "terminal"],
-        "content": (
-            "If a POS terminal freezes at checkout: (1) ask the associate to hold "
-            "the power button 10s to force-restart, (2) confirm Wi-Fi signal on the "
-            "terminal, (3) if it recurs more than twice in a shift, file a ticket "
-            "with priority High and tag 'pos-hardware'."
-        ),
-    },
-    {
-        "title": "Pharmacy label printer not printing",
-        "tags": ["printer", "pharmacy", "label", "rx"],
-        "content": (
-            "Pharmacy label printers (Zebra ZD-series) most often fail due to a "
-            "roll misfeed. Reseat the label roll, close the lid firmly, and send a "
-            "test label from the dispensing system. If the print queue shows a "
-            "stuck job, clear it before retrying."
-        ),
-    },
-    {
-        "title": "Scan & Go app login errors",
-        "tags": ["scan and go", "app", "login", "mobile"],
-        "content": (
-            "Scan & Go login failures are usually an expired store Wi-Fi "
-            "certificate. Confirm the store's guest/associate network is online "
-            "via check_system_status, then have the customer force-close and "
-            "reopen the app."
-        ),
-    },
-    {
-        "title": "Password reset policy",
-        "tags": ["password", "reset", "account", "login"],
-        "content": (
-            "Password resets for store-system accounts must be approved by an IT "
-            "Admin before being executed, logged with the requester's name, and "
-            "the user must change the temporary password on first login."
-        ),
-    },
-    {
-        "title": "Inventory sync failures",
-        "tags": ["inventory", "sync", "stock"],
-        "content": (
-            "If a store's inventory sync is more than 6 hours stale, check the "
-            "store's network status first. If network is healthy, escalate to "
-            "on-call — stale syncs can cause incorrect out-of-stock displays."
-        ),
-    },
-]
+class InventoryQuery(BaseModel):
+    sku: str = Field(description="Product SKU, for example 'AMOX-500'")
+    store_id: str = Field(description="Store number, for example '1042'")
+
+
+def _log_retry(retry_state):
+    tool_emit(step_type="retry", label=f"Retry — search_inventory attempt {retry_state.attempt_number} failed",
+              status="retry", detail=f"{retry_state.outcome.exception()} · backing off before the next attempt",
+              risk_tier="low")
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
+       retry=retry_if_exception_type(TransientError), before_sleep=_log_retry)
+def _query_inventory(sku: str, store_id: str) -> dict:
+    return mock_services.INVENTORY.query(sku, store_id)
+
+
+@tool(args_schema=InventoryQuery)
+def search_inventory(sku: str, store_id: str) -> str:
+    """Look up live stock for one SKU at one store via the inventory search
+    service. Use only when the user asks about current availability or stock."""
+    try:
+        result = _query_inventory(sku, store_id)
+    except RetryError as e:
+        tool_emit(step_type="fallback", label="Fallback — inventory search unavailable", status="blocked",
+                  detail=f"3 attempts failed ({e.last_attempt.exception()}); telling the user stock is unknown",
+                  risk_tier="low")
+        return _err("inventory_search_unavailable", retryable=False,
+                    hint="Tell the user current stock is unknown right now. Do not guess a number.")
+    if not result["found"]:
+        return _err("not_found", hint=f"No inventory record for {result['sku']} at store {result['store_id']}.")
+    return _ok(source="inventory-search (mock)", **result)
+
 
 MOCK_SYSTEMS = {
     "POS-1042": {"name": "POS Terminal (Store #1042)", "status": "degraded", "detail": "Intermittent freeze on checkout screen"},
     "PHARM-PRINT-07": {"name": "Pharmacy Label Printer #07", "status": "offline", "detail": "No response — possible roll misfeed"},
-    "WIFI-STORE-1042": {"name": "Store #1042 Guest/Associate Wi-Fi", "status": "healthy", "detail": "All access points online"},
-    "SCANGO-APP": {"name": "Scan & Go Mobile App (backend)", "status": "healthy", "detail": "No active incidents"},
+    "WIFI-STORE-1042": {"name": "Store #1042 Wi-Fi", "status": "healthy", "detail": "All access points online"},
     "RX-DISPENSE-SYS": {"name": "Rx Dispensing System", "status": "healthy", "detail": "All automation cells reporting normal"},
 }
-
-MOCK_INVENTORY_SYNC = {
-    "1042": {"last_sync": datetime.now() - timedelta(hours=7, minutes=12), "status": "stale"},
-    "2201": {"last_sync": datetime.now() - timedelta(minutes=18), "status": "current"},
-    "0588": {"last_sync": datetime.now() - timedelta(hours=1, minutes=5), "status": "current"},
-}
-
-# In-memory ticket counter for the demo session
-_TICKET_COUNTER = {"n": 4812}
-
-
-# -----------------------------------------------------------------------------
-# LOW RISK — read-only tools
-# -----------------------------------------------------------------------------
-@tool
-def search_knowledge_base(query: str) -> str:
-    """Search internal IT knowledge base / runbooks for troubleshooting guidance.
-    Use this first before filing a ticket or escalating."""
-    q = query.lower()
-    hits = [a for a in MOCK_KB if any(tag in q for tag in a["tags"]) or q in a["title"].lower()]
-    if not hits:
-        return "No knowledge base articles matched that query. Consider filing a ticket."
-    out = []
-    for a in hits[:3]:
-        out.append(f"### {a['title']}\n{a['content']}")
-    return "\n\n".join(out)
 
 
 @tool
 def check_system_status(system_id: str) -> str:
     """Check the live status of a store system by its ID, e.g. 'POS-1042',
-    'PHARM-PRINT-07', 'WIFI-STORE-1042', 'SCANGO-APP', 'RX-DISPENSE-SYS'."""
+    'PHARM-PRINT-07', 'WIFI-STORE-1042', 'RX-DISPENSE-SYS'."""
     sys = MOCK_SYSTEMS.get(system_id.upper())
     if not sys:
-        known = ", ".join(MOCK_SYSTEMS.keys())
-        return f"Unknown system ID '{system_id}'. Known systems: {known}"
-    return f"{sys['name']}: status={sys['status']} — {sys['detail']}"
+        return _err("unknown_system", hint=f"Known systems: {', '.join(MOCK_SYSTEMS)}")
+    return _ok(system_id=system_id.upper(), **sys)
 
 
 @tool
-def lookup_store_inventory_sync_status(store_id: str) -> str:
-    """Look up when a store's inventory last successfully synced, by store ID,
-    e.g. '1042'."""
-    rec = MOCK_INVENTORY_SYNC.get(store_id)
-    if not rec:
-        return f"No inventory sync record found for store {store_id}."
-    age = datetime.now() - rec["last_sync"]
-    hours = round(age.total_seconds() / 3600, 1)
-    return f"Store {store_id}: last sync {hours}h ago — status: {rec['status']}"
+def list_users() -> str:
+    """List store-system users and their current roles."""
+    return _ok(users=db.list_users())
+
+
+class ResetScope(BaseModel):
+    scope: Literal["tickets", "users", "all_demo_data"] = Field(
+        description="Which demo data to reset: 'tickets', 'users' (also clears password-reset tokens), "
+                    "or 'all_demo_data' (tickets, users, reset tokens and inventory)."
+    )
+
+
+@tool(args_schema=ResetScope)
+def preview_sql_reset(scope: str) -> str:
+    """Dry run of a database reset: reports how many rows each table in the
+    scope holds now, without changing anything. Always call this before
+    reset_sql_state, and show the counts to the user."""
+    return _ok(dry_run=True, scope=scope, rows_now=db.preview_reset(scope),
+               note="Nothing was changed. reset_sql_state would delete these rows and restore seed data.")
 
 
 # -----------------------------------------------------------------------------
-# MEDIUM RISK — write actions, but non-destructive and reversible
+# MEDIUM RISK — writes, but non-destructive
 # -----------------------------------------------------------------------------
-@tool
+class TicketArgs(BaseModel):
+    summary: str = Field(description="One-line description of the problem")
+    priority: Literal["Low", "Medium", "High"] = "Medium"
+
+
+@tool(args_schema=TicketArgs)
 def create_itsm_ticket(summary: str, priority: str = "Medium") -> str:
-    """File an IT support ticket. priority should be one of Low, Medium, High."""
-    _TICKET_COUNTER["n"] += 1
-    ticket_id = f"IT-{_TICKET_COUNTER['n']}"
-    return f"Ticket {ticket_id} created (priority={priority}): {summary}"
-
-
-@tool
-def escalate_to_oncall(issue_summary: str) -> str:
-    """Page the on-call engineer for an urgent issue that needs human attention now."""
-    ref = str(uuid.uuid4())[:8]
-    return f"🔔 On-call engineer paged (ref: {ref}) for: {issue_summary}"
+    """File an IT support ticket for a store problem."""
+    ticket_id = db.create_ticket(summary, priority)
+    return _ok(ticket_id=f"IT-{ticket_id}", priority=priority, summary=summary)
 
 
 # -----------------------------------------------------------------------------
-# HIGH RISK — destructive / sensitive actions.
-#
-# IMPORTANT: these functions are the REAL actions, only ever invoked directly
-# by the Streamlit approval-handling code AFTER a human clicks Approve — never
-# bound directly to the agent. See agent.py's `make_guarded_tool` wrapper,
-# which is what the agent actually calls, and which only ever QUEUES a
-# request instead of running these.
+# HIGH RISK — destructive / auth-changing. These run only after a human
+# approves, in the graph's admin_tools node.
 # -----------------------------------------------------------------------------
-def execute_reset_user_password(username: str) -> str:
-    temp_pw = f"Temp{random.randint(1000, 9999)}!"
-    return f"Password reset for '{username}'. Temporary password issued: {temp_pw} (must change on next login)."
+def _require_admin(config: RunnableConfig, action: str):
+    role, user = _caller(config)
+    allowed = role == "IT Admin"
+    tool_emit(step_type="auth_check", label=f"Authorization — {action}",
+              status="ok" if allowed else "blocked",
+              detail=f"caller {user} has session role '{role}'" + ("" if allowed else " — admin required"),
+              risk_tier="high")
+    return None if allowed else _err("forbidden", hint="Only an IT Admin session can do this.")
 
 
-def execute_restart_store_device(device_id: str) -> str:
-    return f"Restart command sent to device '{device_id}'. Expected back online in ~2 minutes."
+@tool(args_schema=ResetScope)
+def reset_sql_state(scope: str, config: RunnableConfig) -> str:
+    """Reset demo data in the SQL database for one scope: deletes the rows and
+    restores the seed data. Destructive: requires human approval. Call
+    preview_sql_reset first."""
+    denied = _require_admin(config, "reset_sql_state")
+    if denied:
+        return denied
+    deleted = db.reset_scope(scope)
+    return _ok(scope=scope, deleted_rows=deleted, restored="seed data")
 
 
-# Human-readable descriptions used in the approval UI
-HIGH_RISK_DESCRIPTIONS = {
-    "reset_user_password": "Reset a store employee's system password (issues a temporary password).",
-    "restart_store_device": "Remotely restart a store device (POS terminal, printer, etc.) — interrupts active use.",
-}
+class RoleArgs(BaseModel):
+    username: str = Field(description="Username, for example 'pat.lee'")
+    new_role: Literal["store_associate", "pharmacist", "it_admin"]
+
+
+@tool(args_schema=RoleArgs)
+def update_user_role(username: str, new_role: str, config: RunnableConfig) -> str:
+    """Change a user's role. Requires human approval."""
+    denied = _require_admin(config, "update_user_role")
+    if denied:
+        return denied
+    user = db.get_user(username)
+    if user is None:
+        return _err("unknown_user", hint="Call list_users to see valid usernames.")
+    db.set_user_role(username, new_role)
+    return _ok(username=username, old_role=user["role"], new_role=new_role)
+
+
+class UsernameArgs(BaseModel):
+    username: str = Field(description="Username, for example 'pat.lee'")
+
+
+@tool(args_schema=UsernameArgs)
+def send_password_reset(username: str, config: RunnableConfig) -> str:
+    """Email the user a one-time password reset link that expires in 15
+    minutes. Never accept, set or reveal a password yourself. Requires
+    human approval."""
+    denied = _require_admin(config, "send_password_reset")
+    if denied:
+        return denied
+    user = db.get_user(username)
+    if user is None:
+        return _err("unknown_user", hint="Call list_users to see valid usernames.")
+    token = secrets.token_urlsafe(16)
+    expires = (datetime.now() + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    db.store_reset_token(username, hashlib.sha256(token.encode()).hexdigest(), expires)
+    mock_services.MAILBOX.send(
+        to=user["email"], subject="Your password reset link",
+        body=f"Reset your password: https://intranet.example/reset?token={token} (expires {expires})",
+    )
+    # The token goes to the mailbox only — never back to the model.
+    return _ok(username=username, sent_to="the user's email on file", expires=expires)
+
 
 ALL_TOOLS = [
-    search_knowledge_base,
-    check_system_status,
-    lookup_store_inventory_sync_status,
-    create_itsm_ticket,
-    escalate_to_oncall,
+    search_inventory, check_system_status, list_users, preview_sql_reset,
+    create_itsm_ticket, reset_sql_state, update_user_role, send_password_reset,
 ]
+
+
+def tools_for_role(role: str):
+    allowed = set(ROLE_TOOL_ACCESS.get(role, []))
+    return [t for t in ALL_TOOLS if t.name in allowed]

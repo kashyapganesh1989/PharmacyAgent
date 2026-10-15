@@ -4,4 +4,10 @@ __pycache__/
 venv/
 .env
 data/audit_log.csv
+data/demo.db
+data/checkpoints.db
+data/index/
+data/uploads/
 .streamlit/secrets.toml
+data/*.db-shm
+data/*.db-wal

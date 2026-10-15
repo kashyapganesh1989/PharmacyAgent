@@ -1,6 +1,6 @@
 # =============================================================================
 # Pharmacy IT Operations Agent — Guardrails
-# Author : Abhinav Rawat · AI Architect · AI Playground
+# AI Friday
 #
 # Two kinds of guardrail, applied BEFORE and AFTER the LLM — never relying on
 # the system prompt alone:

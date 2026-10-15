@@ -1,6 +1,6 @@
 # =============================================================================
 # Pharmacy IT Operations Agent — Rate Limiter
-# Author : Abhinav Rawat · AI Architect · AI Playground
+# AI Friday
 #
 # A simple in-memory token-bucket limiter, scoped to the Streamlit session.
 # This guards the TOOL/AGENT layer, not just the chat box — the point made in

@@ -1,0 +1,9 @@
+[theme]
+# The app is dark, so Streamlit's built-in widgets (expanders, radios, sliders,
+# tables, captions, alerts) must use the dark base too; on the default light
+# base they draw dark-grey text that disappears on the dark background.
+base = "dark"
+primaryColor = "#00D4AA"
+backgroundColor = "#080C14"
+secondaryBackgroundColor = "#131C2E"
+textColor = "#F0F2FF"

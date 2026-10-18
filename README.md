@@ -39,8 +39,9 @@ The only external call is to OpenAI (chat model and embeddings).
 | Retries with backoff, then an honest fallback | `agent/tools.py` → `search_inventory` |
 | Reset tool limited to an allowlist of scopes, one transaction | `agent/db.py` → `RESET_SCOPES`, `reset_scope` |
 | Passwords never pass through the model | `agent/tools.py` → `send_password_reset` |
+| Optional external tool: public web lookup (Wikipedia), off by default, untrusted results | `agent/tools.py` → `web_search`; sidebar switch "Allow web search" |
 | Input / output guardrails | `agent/guardrails.py` |
-| Rate limiting (per session) | `agent/rate_limiter.py` |
+| Rate limiting on agent tool calls (10 per 60 s, per conversation) | `agent/rate_limiter.py`; checked in `agent/graph.py` → `route_after_agent` |
 | Trace + SQL audit log | `agent/callbacks.py` → `Recorder`, `AuditCallbackHandler` |
 | State that survives a restart | `agent/graph.py` (SQLite checkpointer), `agent/db.py` (`app_meta`) |
 
@@ -49,10 +50,11 @@ The only external call is to OpenAI (chat model and embeddings).
 ```
 Upload → validate → save → Ingest (extract → chunk → embed) → FAISS (data/index/)
 
-Chat turn → Rate limiter → Input guardrail → Role allowlist → LangGraph:
-    retrieve → agent ─┬→ tools ────────────────┐
-                      ├→ ⏸ approval → admin_tools ┤
+Chat turn → Input guardrail → Role allowlist → LangGraph:
+    retrieve → agent ─┬→ tools ────────────────┐   (every tool step first passes
+                      ├→ ⏸ approval → admin_tools ┤    the tool-call rate limiter)
                       ├→ not_allowed ───────────┤
+                      ├→ rate_limited ──────────┤
                       └→ END        agent ←─────┘
 → Citation check → Output guardrail → Response
 ```
@@ -72,7 +74,7 @@ PharmacyAgent/
 │   ├── mock_services.py     # Mock inventory search (with failure switch) and mailbox
 │   ├── callbacks.py         # Trace recorder + LangChain callback handler
 │   ├── guardrails.py        # Input/output guardrail checks
-│   └── rate_limiter.py      # Session-scoped rate limiter
+│   └── rate_limiter.py      # Tool-call rate limiter (per conversation thread)
 ├── data/
 │   ├── samples/             # Sample documents for step 1
 │   ├── demo.db              # Created on first run

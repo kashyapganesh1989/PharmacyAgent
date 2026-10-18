@@ -11,15 +11,25 @@
 #                      land here instead of being sent anywhere.
 # =============================================================================
 
+import sys
 import threading
 import time
+import types
 from datetime import datetime
 
 from agent import db
 
+# Streamlit reloads every project module when a source file changes while the
+# app runs, but a cached graph keeps using the old modules. The live service
+# objects therefore live in a registry outside the reloaded modules, so old and
+# new code share one mailbox and one inventory, and a reload empties nothing.
+_STATE = sys.modules.setdefault("_pharmacy_agent_services", types.ModuleType("_pharmacy_agent_services"))
 
-class TransientError(Exception):
-    """A failure worth retrying (timeout, 503...)."""
+if not hasattr(_STATE, "TransientError"):
+    class TransientError(Exception):
+        """A failure worth retrying (timeout, 503...)."""
+    _STATE.TransientError = TransientError
+TransientError = _STATE.TransientError
 
 
 class InventorySearch:
@@ -56,15 +66,24 @@ class Mailbox:
                                   "subject": subject, "body": body})
 
 
-# Process-wide singletons: they survive Streamlit reruns, and the demo's
-# "Restart services" button deliberately rebuilds them.
-INVENTORY = InventorySearch()
-MAILBOX = Mailbox()
+# Process-wide singletons: they survive Streamlit reruns and module reloads, and
+# the demo's "Restart services" button deliberately rebuilds them. Read them as
+# mock_services.INVENTORY / mock_services.MAILBOX; both resolve through _STATE.
+if not hasattr(_STATE, "inventory"):
+    _STATE.inventory = InventorySearch()
+    _STATE.mailbox = Mailbox()
+
+
+def __getattr__(name):
+    if name == "INVENTORY":
+        return _STATE.inventory
+    if name == "MAILBOX":
+        return _STATE.mailbox
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def restart_services():
-    global INVENTORY, MAILBOX
-    fail_mode = INVENTORY.fail_mode
-    INVENTORY = InventorySearch()
-    INVENTORY.fail_mode = fail_mode
-    MAILBOX = Mailbox()
+    fail_mode = _STATE.inventory.fail_mode
+    _STATE.inventory = InventorySearch()
+    _STATE.inventory.fail_mode = fail_mode
+    _STATE.mailbox = Mailbox()

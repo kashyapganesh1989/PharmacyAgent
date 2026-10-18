@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     summary TEXT NOT NULL,
     priority TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS documents (
     filename TEXT PRIMARY KEY,
@@ -141,6 +142,9 @@ def init_db():
     """Creates tables and seeds baseline data the first time only."""
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Databases created before ticket notes existed get the column added.
+        if "notes" not in {r["name"] for r in conn.execute("PRAGMA table_info(tickets)")}:
+            conn.execute("ALTER TABLE tickets ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
         if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             _seed_tables(conn, ["users", "inventory", "tickets"])
 
@@ -169,6 +173,10 @@ def reset_scope(scope: str) -> dict:
         deleted = {}
         for t in tables:  # names come from RESET_SCOPES only, never from the model
             deleted[t] = conn.execute(f"DELETE FROM {t}").rowcount
+        if "tickets" in tables:
+            # Restart ticket numbering, so after a reset the seed tickets are
+            # IT-1 and IT-2 again and the next new ticket is IT-3.
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'tickets'")
         _seed_tables(conn, tables)
     return deleted
 
@@ -214,6 +222,24 @@ def create_ticket(summary: str, priority: str) -> int:
             (summary, priority, now_str()),
         )
         return cur.lastrowid
+
+
+def update_ticket(ticket_id: int, status: str = None, priority: str = None, note: str = None):
+    """Changes a ticket's status and/or priority and appends a dated note.
+    Returns the ticket before and after, or None if it does not exist."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if row is None:
+            return None
+        notes = row["notes"] or ""
+        if note:
+            notes = (notes + "\n" if notes else "") + f"[{now_str()}] {note}"
+        after = {"status": status or row["status"], "priority": priority or row["priority"]}
+        conn.execute("UPDATE tickets SET status = ?, priority = ?, notes = ? WHERE id = ?",
+                     (after["status"], after["priority"], notes, ticket_id))
+        return {"summary": row["summary"],
+                "before": {"status": row["status"], "priority": row["priority"]},
+                "after": after, "notes": notes}
 
 
 # ---- Documents -----------------------------------------------------------------

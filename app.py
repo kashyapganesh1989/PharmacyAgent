@@ -12,7 +12,7 @@
 # Under the hood: LangGraph (retrieve → agent → tools, with a human-approval
 # pause before high-risk tools), FAISS on local disk, SQLite for data, audit
 # log and conversation checkpoints, and mocked external services. Guardrails,
-# rate limiting and a live execution trace wrap every agent turn.
+# a tool-call rate limit and a live execution trace wrap every agent turn.
 # =============================================================================
 
 import html
@@ -30,13 +30,12 @@ from agent import db, mock_services, vectorstore
 from agent.callbacks import STATUS_ICON, AuditCallbackHandler, Recorder, log_event, set_active_recorder
 from agent.graph import build_graph, deny_pending, pending_calls, thread_message_count
 from agent.guardrails import check_prompt_injection, filter_output_pii
-from agent.rate_limiter import check_and_consume, current_usage
-from agent.tools import HIGH_RISK_DESCRIPTIONS, ROLE_TOOL_ACCESS, TOOL_RISK
+from agent.rate_limiter import WINDOW_SECONDS, tool_call_usage
+from agent.tools import HIGH_RISK_DESCRIPTIONS, ROLE_TOOL_ACCESS, TOOL_RISK, WEB_TOOL, tools_for_role
 
 load_dotenv()
 db.init_db()
 
-RATE_LIMIT = 10  # agent turns per 60 s per session
 ROLE_USERS = {"Store Associate": "sam.ortiz", "IT Admin": "alex.kim"}
 CITATION_RE = re.compile(r"\[([^\[\]\s]+?#\d+)\]")
 
@@ -69,7 +68,7 @@ st.markdown("""
     --red:     #FF6B6B;
     --text:    #F0F2FF;
     --sub:     #A8B4CC;
-    --muted:   #6A7A96;
+    --muted:   #93A0B8;
     --mono:    'Space Mono', monospace;
     --sans:    'DM Sans', sans-serif;
 }
@@ -98,6 +97,15 @@ label, .stTextInput label, .stTextArea label, .stRadio label,
     margin-bottom: 6px !important;
 }
 
+/* Captions and hint text: Streamlit's default caption grey is meant for light
+   backgrounds and nearly disappears on this dark theme. */
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p,
+.stCaption, .stCaption p {
+    color: #C9D2E3 !important;
+    opacity: 1 !important;
+    font-size: 14px !important;
+}
+
 .stTextInput > div > div > input, .stTextArea > div > div > textarea {
     background: var(--card) !important;
     border: 1.5px solid var(--border) !important;
@@ -123,7 +131,7 @@ input[type="password"] { font-family: var(--mono) !important; letter-spacing: 3p
     width: 100% !important;
 }
 .stButton > button:hover { opacity: 0.85 !important; }
-.stButton > button:disabled { background: #253450 !important; color: #6A7A96 !important; opacity: 1 !important; }
+.stButton > button:disabled { background: #253450 !important; color: #A8B4CC !important; opacity: 1 !important; }
 
 .stTabs [data-baseweb="tab-list"] {
     background: var(--surface) !important;
@@ -257,7 +265,6 @@ for key, default in {
     "evidence": _load_evidence(),
     "chat_history": [],
     "trace": [],
-    "rate_limit_timestamps": [],
     "last_turn_steps": [],
     "step_results": {},
     "fail_mode": False,
@@ -287,8 +294,15 @@ def audit_since_start(event_type: str, status: str = None) -> int:
 
 
 @st.cache_resource(show_spinner=False)
-def get_graph():
+def _cached_graph(code_version: int):
     return build_graph()
+
+
+def get_graph():
+    # Keyed on the build_graph function itself: when Streamlit reloads the agent
+    # code after a file change, the key changes and the graph is rebuilt, so the
+    # app never keeps running stale agent code.
+    return _cached_graph(id(build_graph))
 
 
 def graph_config(role: str = None) -> dict:
@@ -300,6 +314,7 @@ def graph_config(role: str = None) -> dict:
             "caller_role": role,
             "caller_user": ROLE_USERS[role],
             "min_score": st.session_state.min_score,
+            "web_search": st.session_state.get("web_search", False),
         },
         "recursion_limit": 25,
     }
@@ -316,7 +331,7 @@ STATUS_CLASS = {
 
 def render_pipeline(container, steps):
     if not steps:
-        container.markdown('<p style="font-size:12px;color:#6A7A96;">No activity yet this turn.</p>',
+        container.markdown('<p style="font-size:12px;color:#A8B4CC;">No activity yet this turn.</p>',
                            unsafe_allow_html=True)
         return
     rows = []
@@ -342,11 +357,22 @@ def render_steps_inline(steps):
         lat = f" · {s['latency_ms']}ms" if s.get("latency_ms") else ""
         detail = (s.get("detail") or "").replace("<", "&lt;")
         st.markdown(f"**{icon} {s['label']}**{lat}  \n"
-                    f"<span style='color:#6A7A96;font-size:12.5px;'>{detail}</span>", unsafe_allow_html=True)
+                    f"<span style='color:#A8B4CC;font-size:12.5px;'>{detail}</span>", unsafe_allow_html=True)
 
 
 def badge(text, variant):
     return f'<span class="badge badge-{variant}">{text}</span>'
+
+
+def switch_status(is_on: bool, on_text: str, off_text: str, on_is_warning: bool = False) -> str:
+    """A coloured status line under a sidebar switch, so its state is readable at a glance."""
+    if is_on:
+        color, dot = ("#FF6B6B", "🔴") if on_is_warning else ("#00D4AA", "🟢")
+        text = on_text
+    else:
+        color, dot, text = "#8A98B0", "⚪", off_text
+    return (f'<p style="font-size:12px;font-weight:600;color:{color};margin:-6px 0 10px;">'
+            f'{dot} {text}</p>')
 
 
 # =============================================================================
@@ -386,8 +412,9 @@ with st.sidebar:
     st.markdown('<span class="section-label">👤 Role</span>', unsafe_allow_html=True)
     st.radio("Role", options=["Store Associate", "IT Admin"], label_visibility="collapsed", key="role_radio")
     role = st.session_state.role_radio
-    st.markdown(f'<p style="font-size:12px;color:#6A7A96;margin-top:6px;">Signed in as <b>{ROLE_USERS[role]}</b>. '
-                f'Tools: {", ".join(ROLE_TOOL_ACCESS[role])}</p>', unsafe_allow_html=True)
+    st.markdown(f'<p style="font-size:12px;color:#A8B4CC;margin-top:6px;">Signed in as <b>{ROLE_USERS[role]}</b>. '
+                f'Tools: {", ".join(ROLE_TOOL_ACCESS[role])}'
+                f'{", web_search" if st.session_state.get("web_search") else ""}</p>', unsafe_allow_html=True)
 
     st.markdown('<span class="section-label">🎚 Demo controls</span>', unsafe_allow_html=True)
     st.slider("Retrieval threshold (cosine)", 0.0, 0.9, step=0.05, key="min_score",
@@ -395,11 +422,18 @@ with st.sidebar:
     st.toggle("Simulate inventory search timeout", key="fail_mode",
               help="Makes the mock inventory search fail, to show retries and the fallback.")
     mock_services.INVENTORY.fail_mode = st.session_state.fail_mode
+    st.markdown(switch_status(st.session_state.fail_mode, "ON — stock search fails on purpose",
+                              "OFF — stock search working", on_is_warning=True), unsafe_allow_html=True)
+    st.toggle("Allow web search (Wikipedia)", key="web_search",
+              help="Gives the agent a web_search tool for public facts that aren't in the documents. "
+                   "Off by default so Guided Demo step 4's off-topic question is still 'not covered'.")
+    st.markdown(switch_status(st.session_state.web_search, "ON — agent can search Wikipedia",
+                              "OFF — documents and company tools only"), unsafe_allow_html=True)
 
     st.markdown('<span class="section-label">⏱ Rate Limit</span>', unsafe_allow_html=True)
-    used, limit = current_usage(st.session_state, max_requests=RATE_LIMIT)
+    used, limit = tool_call_usage(st.session_state.thread_id)
     st.progress(min(used / limit, 1.0))
-    st.markdown(f'<p style="font-size:12px;color:#6A7A96;">{used}/{limit} agent turns in the last 60s</p>',
+    st.markdown(f'<p style="font-size:12px;color:#A8B4CC;">{used} of {limit} agent tool calls in the last {WINDOW_SECONDS} seconds</p>',
                 unsafe_allow_html=True)
 
     st.markdown('<span class="section-label">🧭 Live Pipeline (this turn)</span>', unsafe_allow_html=True)
@@ -407,12 +441,12 @@ with st.sidebar:
     render_pipeline(pipeline_box, st.session_state.last_turn_steps)
 
     st.markdown('<hr style="border-color:#253450;margin:1.2rem 0;">', unsafe_allow_html=True)
-    st.markdown(f'<p style="font-size:12px;color:#6A7A96;">Session thread: <code>{st.session_state.thread_id}</code><br>'
+    st.markdown(f'<p style="font-size:12px;color:#A8B4CC;">Session thread: <code>{st.session_state.thread_id}</code><br>'
                 f'Saved in SQLite, so it survives an app restart.</p>', unsafe_allow_html=True)
     if st.button("🔄 New session thread"):
         st.session_state.thread_id = uuid.uuid4().hex[:12]
         db.set_meta("current_thread", st.session_state.thread_id)
-        for key in ["chat_history", "trace", "last_turn_steps", "rate_limit_timestamps"]:
+        for key in ["chat_history", "trace", "last_turn_steps"]:
             st.session_state[key] = []
         st.session_state.step_results = {}
         st.rerun()
@@ -440,10 +474,10 @@ def _absorb_evidence(steps):
         set_evidence(**found)
 
 
-def run_agent(user_msg, *, role=None, resume=False, approval_note=None) -> dict:
+def run_agent(user_msg, *, role=None, resume=False, approval_note=None, force_tool=None) -> dict:
     """Runs one agent turn (or resumes after an approval decision) with the
-    full pipeline: rate limit → input guardrail → role allowlist → LangGraph
-    (retrieve → agent → tools) → citation check → output guardrail."""
+    full pipeline: input guardrail → role allowlist → LangGraph (retrieve →
+    agent → tool-call rate limit → tools) → citation check → output guardrail."""
     role = role or st.session_state.role_radio
     turn_id = f"turn_{uuid.uuid4().hex[:8]}"
     rec = Recorder(turn_id, st.session_state.thread_id, role,
@@ -468,14 +502,6 @@ def run_agent(user_msg, *, role=None, resume=False, approval_note=None) -> dict:
     if not resume:
         st.session_state.chat_history.append({"role": "user", "content": user_msg, "badges": [],
                                               "as_role": role})
-        allowed, retry_after, remaining = check_and_consume(st.session_state, max_requests=RATE_LIMIT)
-        rec.emit(step_type="rate_limit", label="Rate Limiter", status="ok" if allowed else "blocked",
-                 detail=f"{remaining} turns remaining this window" if allowed else f"Limit reached — retry in {retry_after}s")
-        if not allowed:
-            result["answer"] = f"⏳ Rate limit reached. Try again in {retry_after}s."
-            result["badges"] = [("RATE LIMITED", "blocked")]
-            return finish()
-
         blocked, reason = check_prompt_injection(user_msg)
         rec.emit(step_type="input_guardrail", label="Input Guardrail", status="blocked" if blocked else "ok",
                  detail=reason if blocked else "No injection pattern matched", input_data=user_msg)
@@ -484,14 +510,16 @@ def run_agent(user_msg, *, role=None, resume=False, approval_note=None) -> dict:
             result["badges"] = [("BLOCKED", "blocked")]
             return finish()
 
+        bound = [t.name for t in tools_for_role(role, st.session_state.get("web_search", False))]
         rec.emit(step_type="tool_allowlist", label="Role Allowlist",
-                 detail=f"{len(ROLE_TOOL_ACCESS[role])} tool(s) bound for '{role}': {', '.join(ROLE_TOOL_ACCESS[role])}")
+                 detail=f"{len(bound)} tool(s) bound for '{role}': {', '.join(bound)}")
     elif approval_note:
         rec.emit(step_type="approval", label="Human approval decision", status=approval_note[0],
                  detail=approval_note[1], risk_tier="high", log_to_audit=False)
 
     graph = get_graph()
     config = graph_config(role)
+    config["configurable"]["force_tool"] = None if resume else force_tool
     config["callbacks"] = [AuditCallbackHandler(rec, TOOL_RISK)]
     set_active_recorder(rec)
     try:
@@ -506,6 +534,8 @@ def run_agent(user_msg, *, role=None, resume=False, approval_note=None) -> dict:
         set_active_recorder(None)
 
     result["retrieved"] = state.get("retrieved", [])
+    if any(s["type"] == "rate_limit" and s["status"] == "blocked" for s in rec.steps):
+        result["badges"].append(("RATE LIMITED", "blocked"))
     result["pending"] = pending_calls(graph, config)
     if result["pending"]:
         names = ", ".join(f"{c['name']}({json.dumps(c['args'])})" for c in result["pending"])
@@ -768,10 +798,10 @@ STEPS = [
 ]
 
 
-def step_ask(step: int, label: str, prompt: str, role: str = None, key: str = "ask"):
+def step_ask(step: int, label: str, prompt: str, role: str = None, key: str = "ask", force_tool: str = None):
     """A button that sends a fixed prompt to the agent and stores the result for this step."""
     if st.button(label, key=f"s{step}_{key}"):
-        res = run_agent(prompt, role=role)
+        res = run_agent(prompt, role=role, force_tool=force_tool)
         st.session_state.step_results[f"{step}_{key}"] = res
         return res
     return None
@@ -800,7 +830,7 @@ def render_step_actions(step: int):
                 db.set_meta("current_thread", st.session_state.thread_id)
                 st.session_state.evidence = {}
                 db.set_meta("demo_evidence", "{}")
-                for key in ["chat_history", "trace", "last_turn_steps", "rate_limit_timestamps"]:
+                for key in ["chat_history", "trace", "last_turn_steps"]:
                     st.session_state[key] = []
                 st.session_state.step_results = {}
                 mock_services.restart_services()
@@ -895,16 +925,38 @@ def render_step_actions(step: int):
             res = step_ask(4, f"🌍 Ask off-topic: {off}", off, key="offtopic")
             if res and not res["retrieved"] and not res["citations"]:
                 set_evidence(offtopic_ok=True)
-        for k, title in [("4_grounded", "Grounded answer"), ("4_offtopic", "Off-topic answer")]:
+        # Free-form question: for trying the room's own questions. It does not
+        # count toward the checkpoint; the two sample questions do.
+        custom_q = st.text_input("Or ask your own question", key="s4_custom_q",
+                                 placeholder="e.g. Can a store associate open the controlled-substance cabinet?")
+        step4_keys = ["4_grounded", "4_offtopic", "4_custom"]
+
+        def clear_step4_answers():
+            # Clears what is shown on screen only; passed checkpoints and the
+            # conversation history are kept.
+            for k in step4_keys:
+                results.pop(k, None)
+            st.session_state.s4_custom_q = ""
+
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            if st.button("💬 Ask your question", key="s4_custom", disabled=not custom_q.strip()):
+                results["4_custom"] = run_agent(custom_q.strip())
+        with b2:
+            st.button("🧹 Clear answers", key="s4_clear", on_click=clear_step4_answers,
+                      disabled=not any(results.get(k) for k in step4_keys))
+        for k, title in [("4_grounded", "Grounded answer"), ("4_offtopic", "Off-topic answer"),
+                         ("4_custom", "Your question")]:
             if results.get(k):
                 st.markdown(f'<span class="section-label">{title}</span>', unsafe_allow_html=True)
                 show_result(results[k])
 
     elif step == 5:
         fail = st.session_state.fail_mode
-        st.button("🔴 Turn timeout simulation ON" if not fail else "🟢 Turn timeout simulation OFF", key="s5_toggle",
+        # The emoji shows the CURRENT state; the words say what a click does.
+        st.button("🔴 Stock search FAILING (simulated) — click to turn the timeout OFF" if fail else
+                  "🟢 Stock search healthy — click to turn the timeout ON", key="s5_toggle",
                   on_click=lambda: st.session_state.update(fail_mode=not st.session_state.fail_mode))
-        st.caption(f"Inventory search is currently **{'FAILING (simulated timeout)' if fail else 'healthy'}**.")
         step_ask(5, "📦 Ask: Is AMOX-500 in stock at store 1042?", "Is AMOX-500 in stock at store 1042?", key="stock")
         if results.get("5_stock"):
             show_result(results["5_stock"])
@@ -914,6 +966,49 @@ def render_step_actions(step: int):
         if role != "IT Admin":
             st.warning("This step needs the IT Admin role.")
             st.button("Switch to IT Admin", key="s6_role", on_click=lambda: st.session_state.update(role_radio="IT Admin"))
+        # Optional warm-up: the agent files a ticket, then updates it. The reset
+        # below then restores the original tickets, so the new one disappears.
+        st.markdown('<span class="section-label">🎫 First, file and update a ticket (optional)</span>',
+                    unsafe_allow_html=True)
+        # Pre-filled with the demo issue; edit either field to file a different one.
+        n1, n2 = st.columns([4, 1])
+        with n1:
+            new_summary = st.text_input("Issue to file", key="s6_new_summary",
+                                        value="POS-1042 freezes at checkout more than twice this shift.")
+        with n2:
+            new_priority = st.selectbox("Priority", ["High", "Medium", "Low"], key="s6_new_priority")
+        if st.button(f"🎫 Ask the agent to file this {new_priority} ticket", key="s6_ticket_new",
+                     disabled=not new_summary.strip()):
+            results["6_ticket_new"] = run_agent(
+                f"File a {new_priority} priority ticket with exactly this summary: {new_summary.strip()}",
+                force_tool="create_itsm_ticket")
+            st.session_state.pop("s6_ticket_pick", None)  # jump the picker to the new ticket
+        # Update or close any ticket: the presenter picks the action, the agent
+        # carries it out with update_itsm_ticket.
+        tickets = {t["id"]: t for t in db.table_rows("tickets")}
+        actions = {"Set in progress": "in_progress", "Resolve": "resolved", "Close": "closed", "Reopen": "open"}
+        u1, u2, u3 = st.columns([2, 1.3, 2.7])
+        with u1:
+            pick = st.selectbox("Ticket", list(tickets), index=len(tickets) - 1 if tickets else None,
+                                key="s6_ticket_pick",
+                                format_func=lambda i: f"IT-{i} · {tickets[i]['status']} · {tickets[i]['summary'][:40]}")
+        with u2:
+            action = st.selectbox("Action", list(actions), key="s6_ticket_action")
+        with u3:
+            note = st.text_input("Note (optional)", key="s6_ticket_note",
+                                 placeholder="e.g. Technician booked for Friday morning")
+        if st.button(f"✏️ Ask the agent: {action}", key="s6_ticket_update", disabled=pick is None):
+            if actions[action] == "open":  # spelled out: "set to open" alone reads like a no-op
+                prompt = f"Use update_itsm_ticket now to reopen ticket IT-{pick}: change its status back to open"
+            else:
+                prompt = f"Use update_itsm_ticket now: set ticket IT-{pick} to status {actions[action]}"
+            prompt += f" and add the note '{note.strip()}'." if note.strip() else "."
+            results["6_ticket_update"] = run_agent(prompt, force_tool="update_itsm_ticket")
+        for k, title in [("6_ticket_new", "Ticket filed"), ("6_ticket_update", "Ticket updated")]:
+            if results.get(k):
+                st.markdown(f'<span class="section-label">{title}</span>', unsafe_allow_html=True)
+                show_result(results[k])
+        st.markdown('<span class="section-label">🗑 Then reset the tickets</span>', unsafe_allow_html=True)
         step_ask(6, "🗑 Ask: Preview, then reset the tickets demo data", "Preview, then reset the tickets demo data.",
                  key="reset")
         if results.get("6_reset"):
@@ -1161,8 +1256,8 @@ with tab_about:
     st.markdown("""
     <div class="answer-card">
     <code>Upload → validate → save → Ingest (extract → chunk → embed) → FAISS on disk</code><br><br>
-    <code>Chat turn → Rate limiter → Input guardrail → Role allowlist → LangGraph:
-    retrieve → agent → [tools | ⏸ approval → admin_tools | not_allowed] → agent → … →
+    <code>Chat turn → Input guardrail → Role allowlist → LangGraph:
+    retrieve → agent → tool-call rate limit → [tools | ⏸ approval → admin_tools | not_allowed | rate_limited] → agent → … →
     Citation check → Output guardrail → Response</code><br><br>
     SQLite holds users, inventory, tickets, documents, reset tokens (hashed) and the audit log
     (<code>data/demo.db</code>), and the conversation checkpoints (<code>data/checkpoints.db</code>).
@@ -1173,14 +1268,14 @@ with tab_about:
     st.markdown('<span class="section-label">🎯 Tool risk tiers</span>', unsafe_allow_html=True)
     risk_rows = "".join(
         f"<tr><td style='padding:6px 12px;'>{name}</td><td style='padding:6px 12px;'>{badge(risk.upper(), risk)}</td>"
-        f"<td style='padding:6px 12px;'>{'IT Admin' if name not in ROLE_TOOL_ACCESS['Store Associate'] else 'all roles'}</td></tr>"
+        f"<td style='padding:6px 12px;'>{'all roles, when web search is on' if name == WEB_TOOL else 'IT Admin' if name not in ROLE_TOOL_ACCESS['Store Associate'] else 'all roles'}</td></tr>"
         for name, risk in TOOL_RISK.items()
     )
     st.markdown(f"""
     <div class="source-card"><table style="width:100%; border-collapse:collapse;">
-    <tr><th style="text-align:left;padding:6px 12px;color:#6A7A96;">Tool</th>
-        <th style="text-align:left;padding:6px 12px;color:#6A7A96;">Risk tier</th>
-        <th style="text-align:left;padding:6px 12px;color:#6A7A96;">Who can use it</th></tr>
+    <tr><th style="text-align:left;padding:6px 12px;color:#A8B4CC;">Tool</th>
+        <th style="text-align:left;padding:6px 12px;color:#A8B4CC;">Risk tier</th>
+        <th style="text-align:left;padding:6px 12px;color:#A8B4CC;">Who can use it</th></tr>
     {risk_rows}
     </table></div>
     """, unsafe_allow_html=True)

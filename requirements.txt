@@ -1,14 +1,25 @@
+# --- App / UI ---
 streamlit>=1.38.0
+pandas>=2.2.0
+python-dotenv>=1.0.1
+
+# --- LLM + LangChain (OpenAI chat model and embeddings) ---
 langchain>=0.3.0,<1.0.0
 langchain-core>=0.3.78,<1.0.0
-langchain-text-splitters<1.0.0
 langchain-openai>=0.2.0,<1.0.0
 langchain-community>=0.3.0,<1.0.0
+langchain-text-splitters<1.0.0
+
+# --- LangGraph (agent state machine, approval pause, SQLite checkpoints) ---
 langgraph>=0.2.50,<0.7
 langgraph-prebuilt<1.0
 langgraph-checkpoint<3
 langgraph-checkpoint-sqlite<3
+
+# --- Vector DB + document reading ---
 faiss-cpu>=1.8
 pypdf>=4.0
-python-dotenv>=1.0.1
-pandas>=2.2.0
+
+# --- Tool schemas and retries ---
+pydantic>=2.0,<3
+tenacity>=8.2
